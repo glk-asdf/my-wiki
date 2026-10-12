@@ -1,0 +1,25 @@
+{
+  "name": "glk-wiki",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx src/cli.ts",
+    "smoke": "tsx scripts/offline-smoke.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test tests/links.test.ts tests/store.test.ts tests/llm.test.ts tests/compile.test.ts tests/query.test.ts tests/graph.test.ts"
+  },
+  "dependencies": {
+    "gray-matter": "^4.0.3",
+    "openai": "^7.32.0",
+    "zod": "^4.6.6"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}

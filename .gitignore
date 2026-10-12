@@ -1,0 +1,8 @@
+node_modules/
+.state/
+.env
+*.tmp
+
+# 编译/检查命令的调试日志（可能很长，且包含完整的模型输出）
+.*.log
+*.log
