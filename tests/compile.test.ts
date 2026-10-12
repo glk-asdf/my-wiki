@@ -3,12 +3,14 @@ import test from 'node:test';
 import {
   bodyLength,
   buildSourcePage,
+  canonicalTitleKey,
   checkSelfLinks,
   checkUpdateIntegrity,
   formatPlan,
   headingsOf,
   isVerbatim,
   nearDuplicateTitles,
+  planToWorkItems,
   renderLinkCandidates,
   sanitizeDraftBody,
   sourceIdOf,
@@ -170,17 +172,53 @@ test('suggestId：拿标题拼出来的 id 要能给出正确建议（真实踩�
   assert.equal(suggestId('concepts/毫无关系的东西', known, byTitle), null);
 });
 
-test('nearDuplicateTitles：同一概念的两个近义标题要报出来（实测：向量检索 / 向量检索技术）', () => {
-  assert.deepEqual(nearDuplicateTitles(['向量检索技术', '向量检索']), [
-    '「向量检索」与「向量检索技术」看起来是同一个概念的两种叫法，建议合并为一页',
-  ]);
-  // 归一化后完全相同的标题（如 `LLM Wiki` / `llm-wiki`）不归这里管——
-  // 那种情况在批内去重时就已经直接合并了，不需要人来判断
-  assert.deepEqual(nearDuplicateTitles(['LLM Wiki', 'llm-wiki']), []);
+test('nearDuplicateTitles：只报「规范键不同但仍是前缀关系」的存疑对，已能自动合并的不再报', () => {
+  // 规范键相同（含修饰后缀剥离）→ 已被批内合并自动处理，这里不再报警
+  assert.deepEqual(nearDuplicateTitles(['向量检索技术', '向量检索']), []);
+  assert.deepEqual(nearDuplicateTitles(['RAG 系统', 'RAG']), []);
+  // 规范键不同、但存在前缀包含（可能是不同粒度：向量 / 向量检索）→ 仍要提醒人判断
+  const warn = nearDuplicateTitles(['向量', '向量检索']);
+  assert.equal(warn.length, 1);
+  assert.ok(warn[0]!.includes('向量') && warn[0]!.includes('向量检索'), `实际警告：${warn[0]}`);
   // 完全不相关的不要乱报
   assert.deepEqual(nearDuplicateTitles(['向量检索', '关键词检索', '复利效应']), []);
-  // 单字前缀关系太弱，不报（避免把「向量」与「向量检索」这类不同粒度硬扯到一起）
-  assert.deepEqual(nearDuplicateTitles(['向', '向量检索']), []);
+});
+
+test('canonicalTitleKey：剥离中文修饰性后缀，把 X技术 / X 视作同一概念', () => {
+  assert.equal(canonicalTitleKey('向量检索技术'), canonicalTitleKey('向量检索'));
+  assert.equal(canonicalTitleKey('RAG 系统'), canonicalTitleKey('RAG'));
+  assert.equal(canonicalTitleKey('RAG 算法'), canonicalTitleKey('RAG'));
+  // 没有修饰后缀则原样归约
+  assert.equal(canonicalTitleKey('余弦相似度'), '余弦相似度');
+  // 整个词就是后缀（如单字「技术」）不能误并
+  assert.equal(canonicalTitleKey('技术'), '技术');
+  // 区分不同粒度：向量 与 向量检索 规范键不同
+  assert.notEqual(canonicalTitleKey('向量'), canonicalTitleKey('向量检索'));
+});
+
+test('planToWorkItems：批内两个近义标题合并为一页，保留更泛的标题', () => {
+  const ops: Op[] = [
+    { op: 'create', type: 'concept', title: '向量检索技术', oneLiner: 'x', slug: 'vector-search-technology', reason: 'r1' },
+    { op: 'create', type: 'concept', title: '向量检索', oneLiner: 'y', slug: 'vector-retrieval', reason: 'r2' },
+  ];
+  const { items } = planToWorkItems(ops, new Set(), new Map(), new Map());
+  assert.equal(items.length, 1, '两个近义标题应合并成一个 create');
+  assert.equal(items[0]!.title, '向量检索', '应保留更泛的标题');
+  assert.equal(items[0]!.id, 'concepts/vector-retrieval', 'id 应随更泛的标题同步');
+  assert.ok(items[0]!.patch.includes('r1') && items[0]!.patch.includes('r2'), '两方的 patch 都要保留');
+});
+
+test('planToWorkItems：模型写了 X技术 而已有页面叫 X 时，create 收敛为 update', () => {
+  const ops: Op[] = [{ op: 'create', type: 'concept', title: 'RAG 系统', oneLiner: 'x', slug: 'rag-system', reason: 'r' }];
+  const existingByTitle = new Map([['rag', 'concepts/rag']]);
+  const existing = new Map([
+    ['concepts/rag', { meta: { id: 'concepts/rag', type: 'concept', title: 'RAG', oneLiner: '检索增强生成', aliases: [] } } as never],
+  ]);
+  const { items, convertedToUpdate } = planToWorkItems(ops, new Set(), existing, existingByTitle);
+  assert.equal(items.length, 1);
+  assert.equal(items[0]!.kind, 'update', '应收敛为 update');
+  assert.equal(items[0]!.id, 'concepts/rag');
+  assert.deepEqual(convertedToUpdate, ['RAG 系统 → concepts/rag']);
 });
 
 test('formatPlan：四种操作都能打印', () => {

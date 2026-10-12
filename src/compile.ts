@@ -269,13 +269,71 @@ async function extractPass(llm: LlmClient, rawRelPath: string, rawText: string):
 
 // ------------------------------------------------------------------ Pass 2
 
+/**
+ * 为每个抽取出的概念/实体挑出最相关的已有页面——只看标题/id/oneLiner 的重叠，不读正文。
+ * 这是 plan 阶段决定「update 还是 create」的关键输入：模型只有看到了已有页面的**内容**，
+ * 才判断得出「向量检索」讲的其实就是「临时检索」的检索阶段。卡片清单只有一句话摘要，
+ * 信息量不够，所以这里再把命中候选的**正文摘录**喂给模型（见 renderRelatedPages）。
+ */
+function relatedEntries(extract: Extract, cards: readonly IndexEntry[]): IndexEntry[] {
+  if (cards.length === 0) return [];
+  const names = [
+    ...extract.concepts.map((item) => item.name),
+    ...extract.entities.map((item) => item.name),
+  ];
+  const scored = new Map<string, number>();
+  for (const name of names) {
+    const nk = titleKey(name);
+    if (nk.length < 2) continue;
+    for (const page of cards) {
+      const pk = titleKey(page.title);
+      let score = 0;
+      if (pk.includes(nk) || nk.includes(pk)) score += 3; // 名字互相包含：强信号
+      else if (titleKey(page.oneLiner).includes(nk)) score += 1; // oneLiner 提到该名字
+      if (score > 0) scored.set(page.id, Math.max(scored.get(page.id) ?? 0, score));
+    }
+  }
+  return [...scored.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(([id]) => cards.find((card) => card.id === id))
+    .filter((card): card is IndexEntry => card !== undefined);
+}
+
+/** 把命中候选页面的正文摘录拼成一段，供 plan 阶段判断语义等价 */
+async function renderRelatedPages(cards: readonly IndexEntry[], extract: Extract): Promise<string> {
+  const related = relatedEntries(extract, cards);
+  if (related.length === 0) return '（没有疑似相关的已有页面）';
+  const blocks: string[] = [];
+  for (const page of related) {
+    let body: string;
+    try {
+      body = stripAutoBacklinks((await readPage(page.id)).body);
+    } catch {
+      continue;
+    }
+    const headings = headingsOf(body);
+    const excerpt = body.replace(/^#.*\n/, '').replace(/\n{2,}/g, ' ').trim().slice(0, 220);
+    blocks.push(
+      `### ${page.title} (${page.id}) — ${page.oneLiner}\n` +
+        `小节：${headings.join(' / ')}\n` +
+        `正文摘录：「${excerpt}」`,
+    );
+  }
+  return blocks.join('\n\n');
+}
+
 async function planPass(
   llm: LlmClient,
   extract: Extract,
   cards: readonly IndexEntry[],
   rawRelPath: string,
 ): Promise<Op[]> {
-  const [rules, taxonomy] = await Promise.all([loadRules(), loadTaxonomy()]);
+  const [rules, taxonomy, relatedBlock] = await Promise.all([
+    loadRules(),
+    loadTaxonomy(),
+    renderRelatedPages(cards, extract),
+  ]);
   const stem = slugify(path.basename(rawRelPath).replace(/\.md$/i, ''));
   const isEmpty = cards.length === 0;
 
@@ -296,6 +354,10 @@ async function planPass(
       '',
       '【wiki 现有页面清单】(id | 类型 | 标题 | 一句话摘要 | 别名)',
       renderCards(cards),
+      '',
+      '【可能相关的已有页面正文】下面这些已存在页面，按「与本次取材标题的重叠」挑出来。' +
+        '判断 update 还是 create 时**必看**：如果其中某页已经讲了这件事，必须 update 它，不要另起新页。',
+      relatedBlock,
       '',
       `【当前状态】共 ${cards.length} 个页面。`,
       isEmpty
@@ -366,11 +428,39 @@ function titleKey(text: string): string {
   return text.toLowerCase().replace(/[\s（）()【】\[\]「」『』：:、,，.。·\-_/]/g, '');
 }
 
+/**
+ * 中文概念常带「修饰性后缀」：`向量检索技术`、`RAG 系统`、`RAG 算法` 与 `向量检索`/`RAG`
+ * 是同一个概念的两种叫法。把后缀剥掉得到**规范键**，用于：
+ *   - 批内去重（两个 create 归一到同一键 → 合并）
+ *   - 已有页面匹配（模型写了 `RAG技术` 而页面叫 `RAG` → 收敛成 update）
+ *
+ * 只剥「X 的修饰语」这种组合：键必须以 X 开头、且 X 至少 2 字，避免把 `技术` 这种独立词误并。
+ */
+const MODIFIER_SUFFIXES = [
+  '技术', '方法', '方式', '系统', '模型', '机制', '算法', '工具', '平台', '思想',
+  '范式', '概念', '方案', '框架', '流程', '策略', '原理', '实现', '应用', '实践',
+  '理论', '引擎', '服务', '组件', '模块', '结构', '模式', '协议', '标准', '能力', '特性',
+];
+
+function stripModifierSuffix(key: string): string {
+  for (const suffix of MODIFIER_SUFFIXES) {
+    if (key.length > suffix.length && key.endsWith(suffix)) {
+      const base = key.slice(0, key.length - suffix.length);
+      if (base.length >= 2) return base;
+    }
+  }
+  return key;
+}
+
+export function canonicalTitleKey(title: string): string {
+  return stripModifierSuffix(titleKey(title));
+}
+
 function buildTitleIndex(pages: ReadonlyMap<string, Page>): Map<string, string> {
   const index = new Map<string, string>();
   for (const [id, page] of pages) {
     for (const name of [page.meta.title, ...page.meta.aliases]) {
-      const key = titleKey(name);
+      const key = canonicalTitleKey(name);
       if (key !== '' && !index.has(key)) index.set(key, id);
     }
   }
@@ -408,10 +498,13 @@ export function suggestId(
  * **只报警，不擅自合并**：自动合并需要判断「两个名字指的是不是一件事」，
  * 而前缀关系既可能是同义（复利 / 复利效应），也可能是不同粒度（向量 / 向量检索）。
  * 猜错的代价是丢概念，比留一个重复页更糟。所以把判断交给人和提示词。
+ *
+ * 注意：规范键相同的一对（如 `向量检索技术` / `向量检索`）已被 `planToWorkItems` 的批内合并自动处理，
+ * 这里不再重复报警，只对「前缀关系但仍不同概念」之类存疑的情况提醒。
  */
 export function nearDuplicateTitles(titles: readonly string[]): string[] {
   const warnings: string[] = [];
-  const keyed = titles.map((title) => ({ title, key: titleKey(title) }));
+  const keyed = titles.map((title) => ({ title, key: canonicalTitleKey(title) }));
 
   for (let i = 0; i < keyed.length; i += 1) {
     for (let j = i + 1; j < keyed.length; j += 1) {
@@ -419,8 +512,10 @@ export function nearDuplicateTitles(titles: readonly string[]): string[] {
       const b = keyed[j];
       if (a === undefined || b === undefined || a.key === '' || b.key === '') continue;
       const [short, long] = a.key.length <= b.key.length ? [a, b] : [b, a];
-      if (short.key.length >= 2 && long.key !== short.key && long.key.startsWith(short.key)) {
-        warnings.push(`「${short.title}」与「${long.title}」看起来是同一个概念的两种叫法，建议合并为一页`);
+      // 规范键相同 → 已被批内合并自动处理，跳过
+      if (short.key === long.key) continue;
+      if (short.key.length >= 2 && long.key.startsWith(short.key)) {
+        warnings.push(`「${short.title}」与「${long.title}」看起来是同一概念的两种叫法（前缀关系），请确认是否应合并为一页`);
       }
     }
   }
@@ -438,7 +533,7 @@ interface WorkItem {
 }
 
 /** 把操作计划展开成「要写哪些页面」，并在内存里定好 id（此时还没有任何写盘） */
-function planToWorkItems(
+export function planToWorkItems(
   ops: readonly Op[],
   existingIds: ReadonlySet<string>,
   existing: ReadonlyMap<string, Page>,
@@ -514,18 +609,26 @@ function planToWorkItems(
       continue;
     }
 
-    // create：同批内标题重名视为同一页，合并处理。
-    // 用**归一化键**而不是原始字符串：`LLM Wiki` 与 `llm-wiki` 归一化后相同，
-    // 那是明确无疑的同一概念，直接合并（不像前缀关系那样需要人来判断）。
-    const key = titleKey(op.title);
+    // create：同批内视为同一页的，合并处理，保留更「泛」的那个标题。
+    // 用**规范化键**而不是原始字符串，覆盖三类等价：
+    //   · `LLM Wiki` 与 `llm-wiki` 归一化后相同 → 明确同一概念，合并
+    //   · `向量检索技术` 与 `向量检索` → 剥掉「技术」修饰后缀后归一到同一键，合并
+    //   · `RAG 系统` 与已有页面 `RAG` → 同样归一到同一键，收敛成 update
+    const key = canonicalTitleKey(op.title);
     const merged = byTitle.get(key);
     if (merged !== undefined) {
       merged.patch = `${merged.patch}\n${op.reason}`;
+      // 取更短（更泛）的标题作为页面名，并同步 slug/id，避免出现「向量检索」内容却叫「向量检索技术」
+      if (op.title.trim().length < merged.title.length) {
+        merged.title = op.title.trim();
+        const slug = slugify(op.slug !== undefined && op.slug.trim() !== '' ? op.slug : op.title);
+        merged.id = `${TYPE_DIRS[op.type]}/${slug}`;
+      }
       continue;
     }
 
     // 已有同名或别名命中的页面时，把 create 收敛成 update，绝不造重复页
-    const samePageId = existingByTitle.get(titleKey(op.title));
+    const samePageId = existingByTitle.get(canonicalTitleKey(op.title));
     if (samePageId !== undefined) {
       const target = existing.get(samePageId);
       convertedToUpdate.push(`${op.title} → ${samePageId}`);
@@ -597,7 +700,7 @@ export function sourceRelatedIds(
   const ids = new Set(newIds);
   const names = [...extract.concepts.map((item) => item.name), ...extract.entities.map((item) => item.name)];
   for (const name of names) {
-    const id = existingByTitle.get(titleKey(name));
+    const id = existingByTitle.get(canonicalTitleKey(name));
     if (id !== undefined) ids.add(id);
   }
   return [...ids].sort();
