@@ -1,4 +1,4 @@
-# glk-wiki
+# my-wiki
 
 把 `raw/` 下的原始素材**编译**成一张互相链接的 Markdown wiki，而不是在提问时临时检索。
 
@@ -39,7 +39,7 @@ pnpm dev status           # 看页面数、死链、孤立页
 pnpm dev query "LLM Wiki 和 RAG 有什么区别？"
 ```
 
-`.env` 里只有四个变量：`GLK_LLM_BASE_URL` / `GLK_LLM_API_KEY` / `GLK_LLM_MODEL` / `GLK_LLM_TIMEOUT_MS`。
+`.env` 里只有四个变量：`MY_WIKI_LLM_BASE_URL` / `MY_WIKI_LLM_API_KEY` / `MY_WIKI_LLM_MODEL` / `MY_WIKI_LLM_TIMEOUT_MS`。
 换后端只改前三个，不需要动代码。
 
 ---
@@ -119,7 +119,7 @@ raw/foo.md
 ## 目录结构
 
 ```
-glk-wiki/
+my-wiki/
 ├─ doc/            设计文档（DESIGN.md）、分步开发文档（DEVELOPMENT.md）、素材（wiki.md）
 ├─ raw/            原始素材
 ├─ wiki/           编译产物

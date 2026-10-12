@@ -22,7 +22,7 @@ const CLI_OPTIONS = {
   help: { type: 'boolean', short: 'h', default: false },
 } as const;
 
-const USAGE = `glk-wiki —— 把 raw/ 下的素材编译成互相链接的 Markdown wiki
+const USAGE = `my-wiki —— 把 raw/ 下的素材编译成互相链接的 Markdown wiki
 
 用法：
   pnpm dev check                      验证 LLM 配置（key / 端点 / 模型名）是否可用
@@ -60,7 +60,7 @@ function parseCli(): ReturnType<typeof parseArgs<{ options: typeof CLI_OPTIONS; 
 /** 各家把真正的原因塞在响应体的 code 里，得挖出来，否则只剩一句泛泛的 429 */
 const LLM_ERROR_HINTS: Record<string, string> = {
   '1302': '账户级限速（请求频率过高）。稍等再试；本项目的编译是串行的，正常不该触发。',
-  '1305': '该模型当前过载。免费档常见，稍后重试，或把 GLK_LLM_MODEL 换成另一个免费型号。',
+  '1305': '该模型当前过载。免费档常见，稍后重试，或把 MY_WIKI_LLM_MODEL 换成另一个免费型号。',
   '1301': 'API Key 无效或已失效，请到控制台重新生成。',
   '1210': '请求参数不合法（例如 messages 格式或温度取值）。',
   '1113': '账户余额或免费额度已用尽。',
@@ -81,7 +81,7 @@ function reportLlmFailure(error: unknown): void {
   }
   if (/timed out|timeout/i.test(probe.message ?? '')) {
     console.error('  单次请求超时。免费档高峰期很常见，两个办法：');
-    console.error('    ① 调大超时：在 .env 里加 GLK_LLM_TIMEOUT_MS=300000');
+    console.error('    ① 调大超时：在 .env 里加 MY_WIKI_LLM_TIMEOUT_MS=300000');
     console.error('    ② 直接重跑：已完成的 Pass 会复用缓存，不会白跑（extract 是最贵的一趟）');
   }
   console.error('  （注意：连接失败时不会有 .state/passes/ 落盘——那里只记录成功返回的响应）');

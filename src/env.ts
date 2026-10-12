@@ -24,7 +24,7 @@ export function loadDotEnv(): void {
 }
 
 export function llmConfig(): LlmConfig {
-  const required = ['GLK_LLM_BASE_URL', 'GLK_LLM_API_KEY', 'GLK_LLM_MODEL'] as const;
+  const required = ['MY_WIKI_LLM_BASE_URL', 'MY_WIKI_LLM_API_KEY', 'MY_WIKI_LLM_MODEL'] as const;
   const values = required.map((key) => [key, process.env[key]?.trim() ?? ''] as const);
   const missing = values.filter(([, value]) => value === '').map(([key]) => key);
 
@@ -33,18 +33,18 @@ export function llmConfig(): LlmConfig {
       `缺少环境变量：${missing.join(', ')}\n` +
         '  处理：在项目根目录的 .env 里补上（模板见 .env.example）。\n' +
         '  智谱 GLM 免费示例：\n' +
-        '    GLK_LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4\n' +
-        '    GLK_LLM_API_KEY=<到 https://open.bigmodel.cn 新建一个 API Key>\n' +
-        '    GLK_LLM_MODEL=glm-4.5-flash（或 glm-4.7-flash，它更慢但上下文更大）',
+        '    MY_WIKI_LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4\n' +
+        '    MY_WIKI_LLM_API_KEY=<到 https://open.bigmodel.cn 新建一个 API Key>\n' +
+        '    MY_WIKI_LLM_MODEL=glm-4.5-flash（或 glm-4.7-flash，它更慢但上下文更大）',
     );
   }
 
   const [baseUrl, apiKey, model] = values.map(([, value]) => value) as [string, string, string];
 
-  const timeoutRaw = process.env['GLK_LLM_TIMEOUT_MS']?.trim() ?? '';
+  const timeoutRaw = process.env['MY_WIKI_LLM_TIMEOUT_MS']?.trim() ?? '';
   const timeoutMs = timeoutRaw === '' ? DEFAULT_TIMEOUT_MS : Number(timeoutRaw);
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-    throw new Error(`GLK_LLM_TIMEOUT_MS 必须是正整数（毫秒），当前值：${JSON.stringify(timeoutRaw)}`);
+    throw new Error(`MY_WIKI_LLM_TIMEOUT_MS 必须是正整数（毫秒），当前值：${JSON.stringify(timeoutRaw)}`);
   }
 
   return { baseUrl, apiKey, model, timeoutMs };

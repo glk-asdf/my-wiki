@@ -35,7 +35,7 @@ LLM 输出的容错与校验——真实模型的输出比预想脏得多，详�
 严格对照 `doc/wiki.md` 的三层，一层一个目录：
 
 ```
-glk-wiki/
+my-wiki/
 ├─ doc/                        # 项目文档
 │  ├─ DESIGN.md                #   本设计文档
 │  ├─ DEVELOPMENT.md           #   分步开发文档
@@ -304,9 +304,9 @@ LLM Wiki 与传统 RAG 的核心差异在「做功时机」：前者在摄入时
 
 ```
 # 智谱 GLM（默认）：免费档实测可用
-GLK_LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
-GLK_LLM_API_KEY=<到 https://open.bigmodel.cn 新建>
-GLK_LLM_MODEL=glm-4.5-flash     # 128K；更强的是 glm-4.7-flash（200K），但它会过载
+MY_WIKI_LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
+MY_WIKI_LLM_API_KEY=<到 https://open.bigmodel.cn 新建>
+MY_WIKI_LLM_MODEL=glm-4.5-flash     # 128K；更强的是 glm-4.7-flash（200K），但它会过载
 
 # DeepSeek：https://api.deepseek.com/v1 + deepseek-chat
 # 本地 Ollama：http://localhost:11434/v1 + qwen2.5:14b（key 填任意非空值）

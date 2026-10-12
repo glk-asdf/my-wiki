@@ -7,7 +7,7 @@ import { z } from 'zod';
 import { createLlmClient, escapeInnerQuotes, extractJson, type ChatMessage } from '../src/llm.js';
 
 async function tempDir(): Promise<string> {
-  return mkdtemp(path.join(os.tmpdir(), 'glk-llm-'));
+  return mkdtemp(path.join(os.tmpdir(), 'my-wiki-llm-'));
 }
 
 test('extractJson：裸 JSON、围栏、夹带解释文字', () => {
@@ -186,13 +186,13 @@ test('text：不做结构校验，但同样落盘', async () => {
 
 test('缺少环境变量时，构造真实客户端会给出可读错误', () => {
   const saved = { ...process.env };
-  delete process.env['GLK_LLM_BASE_URL'];
-  delete process.env['GLK_LLM_API_KEY'];
-  delete process.env['GLK_LLM_MODEL'];
+  delete process.env['MY_WIKI_LLM_BASE_URL'];
+  delete process.env['MY_WIKI_LLM_API_KEY'];
+  delete process.env['MY_WIKI_LLM_MODEL'];
   try {
     assert.throws(
       () => createLlmClient({ passesDir: os.tmpdir() }).callCount(),
-      /缺少环境变量：GLK_LLM_BASE_URL, GLK_LLM_API_KEY, GLK_LLM_MODEL/,
+      /缺少环境变量：MY_WIKI_LLM_BASE_URL, MY_WIKI_LLM_API_KEY, MY_WIKI_LLM_MODEL/,
     );
   } finally {
     for (const [key, value] of Object.entries(saved)) process.env[key] = value;
