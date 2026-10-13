@@ -21,7 +21,10 @@ import {
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
-export const ROOT = path.resolve(HERE, '..');
+// 默认指向本仓库根；离线冒烟（scripts/smoke.ts）会把它重定向到一个临时目录，
+// 这样整条流水线跑在一个隔离副本上，绝不会擦掉或改写用户真实的 wiki/ 与 .state/。
+const rootOverride = process.env['MY_WIKI_ROOT']?.trim();
+export const ROOT = rootOverride ? path.resolve(rootOverride) : path.resolve(HERE, '..');
 export const RAW_DIR = path.join(ROOT, 'raw');
 export const WIKI_DIR = path.join(ROOT, 'wiki');
 export const SCHEMA_DIR = path.join(ROOT, 'schema');

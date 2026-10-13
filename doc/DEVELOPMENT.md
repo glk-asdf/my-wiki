@@ -917,15 +917,57 @@ pnpm dev compile --all --force → 允许内容变化，但页面里不得出现
 
 ## S13. 可选扩展（M6，按兴趣选做）
 
-**已实现：`graph --mermaid`**（`src/graph.ts`）
+**已实现：`graph --mermaid`**（`src/graph.ts`）、**断链自动修复 `repair`**（`src/links.ts` 的 `repairDeadLinks` + `src/cli.ts`）、**页面拆分 `split`**（`src/split.ts` 的 `applySplit` + `src/cli.ts`）与 **冲突检测 `conflict`**（`src/conflict.ts` 的 `applyConflicts` + `src/cli.ts`）
 
 ```bash
 pnpm dev graph                       # 连通块 / 超级节点 / 孤立页 / 自链接
 pnpm dev graph --mermaid             # 额外输出可直接粘贴的 Mermaid 代码块
 pnpm dev graph --mermaid --max-nodes 30   # 页面多了只画连接最多的 30 个
+
+pnpm dev repair                      # 把死链按别名/标题就近改写为正确 id
+pnpm dev repair --dry-run            # 只预览，不改动任何文件
+
+pnpm dev split                       # 把超过 400 字的页面拆成「枢纽页 + 子主题页」
+pnpm dev split --dry-run             # 只预览哪些页会被拆，不调 LLM、不落盘
+pnpm dev split --limit 600           # 用别的字数阈值（默认 400）
+
+pnpm dev conflict                    # 报告所有已记录的「争议」小节（离线、只读）
+pnpm dev conflict --detect           # 用 LLM 比对多素材页面，找出隐藏矛盾（dry-run）
+pnpm dev conflict --detect --apply   # 找出矛盾并写入「争议」小节（再 reindex）
 ```
 
-实现要点（都不涉及 LLM，纯函数、可离线测）：
+`repair` 实现要点（都不涉及 LLM，纯函数 + 编排，可离线测）：
+
+- **匹配策略分两层**：先比 id 末段（`canonicalTitleKey`），再比标题/别名索引——与 compile 在重试时
+  给模型的「你要的是哪个 id」用的是同一套归一化（`canonicalTitleKey`），不会两套逻辑各写一份。
+- **`repairDeadLinks` 是纯函数**（`src/links.ts`）：只负责按语法定位链接、跳过 ```` ``` ```` 围栏与
+  `` ` `` 行内代码（那里的是示例不是真链接）、保留显示名（`[[id|显示名]]`）、就地改写；匹配与否交给调用方注入。
+- **保守修复**：只有归一化后**精确命中**才改，匹配不到的链接保持不动并计入「无法修复」清单，
+  绝不靠编辑距离之类模糊匹配硬猜——避免掩盖 schema 问题。
+- **显式命令而非自动跑**：修复会改写正文，做成 `repair` 让用户主动触发（`--dry-run` 可预览），
+  不塞进 `reindex` 里悄悄发生。修复后自动 `reindex` 重算反向链接。
+
+`split` 实现要点（LLM 只做高判断力的事，链接重写由程序确定性完成）：
+
+- **为什么要拆**：`apply` 阶段只要求「单页 ≤400 字」，但模型实际会写出 422、456 字这种略超的页（已实测），
+  长页面在查询时噪声大、命中率低，拆成「枢纽页 + 子主题页」更利于检索。
+- **职责切分**：LLM 只决定「切成哪些子主题、各自写什么」（`splitProposalSchema`：枢纽概述 + 2~6 子页）；
+  **链接重写是纯函数 `applySplit`**——子页若没链回枢纽就补「隶属主题：[[枢纽id]]」、子页里的死链用
+  `repairDeadLinks` 修复（可传 `resolve` 复用 repair 的 `canonicalTitleKey` 逻辑，修不了则记告警），
+  枢纽页 = 概述 + 子主题链接列表 + 原页出链（保证图连通不丢）。核心逻辑全部单测覆盖。
+- **不碰 source 页**：source 是一份素材的摘要页，拆成子摘要页语义不成立，直接跳过。
+- **显式命令 + 幂等**：`split` 主动触发；拆完自动 `reindex`；`--dry-run` 先预览（只统计字数、不调 LLM）。
+- **子页 id 用 `nextFreeId` 分配**，天然避开与现有页的冲突。
+
+`conflict` 实现要点（LLM 只判「是否真矛盾」，写入由纯函数确定性完成）：
+
+- **为什么是事后命令**：每页是逐份素材编译的，单趟编译看不到别的素材，跨素材矛盾只能在「页面 + 它引用的全部素材原文」齐全后比对。所以做成独立命令 `conflict --detect`，而不是塞进 compile。
+- **职责切分**：LLM 只判断「两份及以上素材是否对同一事实给出互斥说法」（`conflictProposalSchema`：topic + 两种说法 + 各自引自哪个素材）；**写入「争议」小节是纯函数 `applyConflicts`**——无矛盾时原样返回（不清除已有争议），有矛盾时按固定格式插入/替换 `## 争议`、更新日期，绝不交给模型改结构、避免凭空造链。
+- **模板新增可选「争议」小节**（concept/entity 模板），compile 提示词同步加了一句「仅当确有矛盾才写、逐条注明引自哪个素材」——未来编译多素材页时也能顺手记录。
+- **报告模式离线可读**：`conflict`（不带 `--detect`）只扫页面、列出所有已记录争议，纯读、不调 LLM、不落盘；`parseDisputes` 会把「（无）/ 无矛盾」这类占位符视为无争议。
+- **保守触发**：`--detect` 只对「≥2 个素材 且 尚无争议小节」的 concept/entity 页跑 LLM，且默认 dry-run，加 `--apply` 才写盘并重算反向链接；source 页跳过。
+
+实现要点（graph，都不涉及 LLM，纯函数、可离线测）：
 
 - **数据只来自 `.state/index.json`**，不额外扫盘。
 - **度数按无向图算**：链接是单向的，但「两个页面是否连在一起」是双向的事。
@@ -944,9 +986,6 @@ pnpm dev graph --mermaid --max-nodes 30   # 页面多了只画连接最多的 30
 
 | 扩展 | 成本 | 学到什么 |
 | :-- | :-- | :-- |
-| 断链自动修复（用别名或相似标题兜底） | 中 | 链接解析的健壮性；但也可能掩盖 schema 问题 |
-| 页面超 400 字自动拆分 | 中 | 又一次「LLM 输出 + 程序校验」的组合拳，且要处理拆分后的链接重写 |
-| 冲突检测（不同素材对同一概念给出矛盾定义） | 中 | 知识管理的真问题，需要在页面里引入「争议」区块 |
 | 极简 Web UI | 高 | 与学习目标关系最弱，最后再做 |
 
 ---

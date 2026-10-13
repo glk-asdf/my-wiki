@@ -81,3 +81,62 @@ export function replaceLinkDisplay(body: string, id: string, name: string): stri
   const re = new RegExp(`\\[\\[${escapeRegExp(id)}(?:\\|[^\\]]*)?\\]\\]`, 'g');
   return body.replace(re, `[[${id}|${name}]]`);
 }
+
+/**
+ * 断链自动修复：把正文中指向不存在页面的 `[[id]]` 改写为一个已存在的正确 id。
+ *
+ * 匹配策略由调用方注入（`isKnown` / `resolve`），本函数只负责「按语法定位链接、跳过代码块、
+ * 保留显示名、就地改写」——保持纯函数、不依赖任何标题归一化逻辑，方便单测。
+ *
+ * - 跳过 ```` ``` ```` 围栏代码块与 `` ` `` 行内代码：那里出现的 `[[...]]` 通常是示例，不是真链接。
+ * - 改写时保留原有的显示名（`[[id|显示名]]`），只对目标 id 做替换。
+ * - 若 `resolve` 返回 `null` 或与原 id 相同，则该链接保持不动并计入 `unrepaired`。
+ */
+export interface RepairResult {
+  body: string;
+  repairs: { from: string; to: string }[];
+  unrepaired: string[];
+}
+
+export function repairDeadLinks(
+  body: string,
+  isKnown: (id: string) => boolean,
+  resolve: (id: string) => string | null,
+): RepairResult {
+  const repairs: { from: string; to: string }[] = [];
+  const unrepaired: string[] = [];
+
+  const skips = [
+    ...body.matchAll(/```[\s\S]*?```/g),
+    ...body.matchAll(/`[^`\n]*`/g),
+  ].map((m) => [m.index ?? 0, (m.index ?? 0) + m[0].length] as const);
+  const inSkip = (pos: number): boolean => skips.some(([s, e]) => pos >= s && pos < e);
+
+  const matches = [...body.matchAll(LINK_RE)];
+  if (matches.length === 0) return { body, repairs, unrepaired };
+
+  let out = '';
+  let cursor = 0;
+  for (const m of matches) {
+    const start = m.index ?? 0;
+    out += body.slice(cursor, start);
+    const raw = m[1] ?? '';
+    const display = m[2];
+    const id = normalizeLinkId(raw);
+    if (isKnown(id) || inSkip(start)) {
+      out += m[0];
+    } else {
+      const target = resolve(id);
+      if (target !== null && target !== id) {
+        out += display ? `[[${target}|${display}]]` : `[[${target}]]`;
+        repairs.push({ from: id, to: target });
+      } else {
+        out += m[0];
+        unrepaired.push(id);
+      }
+    }
+    cursor = start + m[0].length;
+  }
+  out += body.slice(cursor);
+  return { body: out, repairs, unrepaired };
+}

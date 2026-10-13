@@ -6,6 +6,7 @@ import {
   normalizeLinkId,
   parseLinks,
   parseOwnLinks,
+  repairDeadLinks,
   renderBacklinks,
   replaceLinkDisplay,
   stripAutoBacklinks,
@@ -69,4 +70,56 @@ test('replaceLinkDisplay：统一改写指向同一 id 的链接', () => {
   assert.equal(replaceLinkDisplay('见 [[concepts/rag]]。', 'concepts/rag', 'RAG'), '见 [[concepts/rag|RAG]]。');
   assert.equal(replaceLinkDisplay('见 [[concepts/rag|旧名]]。', 'concepts/rag', 'RAG'), '见 [[concepts/rag|RAG]]。');
   assert.equal(replaceLinkDisplay('见 [[concepts/other]]。', 'concepts/rag', 'RAG'), '见 [[concepts/other]]。');
+});
+
+test('repairDeadLinks：按 id 末段归一化修复（含补类型前缀、归一化大小写）', () => {
+  const known = new Set(['concepts/llm-wiki']);
+  const norm = (id: string): string => id.replace(/^[a-z]+\//i, '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const resolve = (id: string): string | null => (norm(id) === 'llmwiki' ? 'concepts/llm-wiki' : null);
+  const { body, repairs, unrepaired } = repairDeadLinks(
+    '见 [[concepts/LLM Wiki]] 与 [[LLM Wiki|大语言模型维基]]。',
+    (x) => known.has(x),
+    resolve,
+  );
+  // 两条都归一化到 concepts/llm-wiki：第一条补了大小写/空格，第二条补了类型前缀
+  assert.deepEqual(repairs, [
+    { from: 'concepts/LLM Wiki', to: 'concepts/llm-wiki' },
+    { from: 'LLM Wiki', to: 'concepts/llm-wiki' },
+  ]);
+  assert.deepEqual(unrepaired, []);
+  assert.equal(body, '见 [[concepts/llm-wiki]] 与 [[concepts/llm-wiki|大语言模型维基]]。');
+});
+
+test('repairDeadLinks：无法匹配的链接保持不动并计入 unrepaired', () => {
+  const known = new Set(['concepts/rag']);
+  const { body, repairs, unrepaired } = repairDeadLinks(
+    '[[concepts/rag]] 与 [[concepts/ghost]]',
+    (x) => known.has(x),
+    () => null,
+  );
+  assert.deepEqual(repairs, []);
+  assert.deepEqual(unrepaired, ['concepts/ghost']);
+  assert.equal(body, '[[concepts/rag]] 与 [[concepts/ghost]]');
+});
+
+test('repairDeadLinks：跳过代码块与行内代码里的伪死链', () => {
+  const known = new Set(['concepts/real']);
+  const { body, repairs } = repairDeadLinks(
+    '```\n[[concepts/fake]]\n```\n行内 `[[concepts/fake]]` 与 [[concepts/real]]',
+    (x) => known.has(x),
+    () => 'concepts/real',
+  );
+  assert.deepEqual(repairs, []);
+  assert.ok(body.includes('[[concepts/fake]]'));
+});
+
+test('repairDeadLinks：同一死链多次出现各修各的', () => {
+  const known = new Set(['concepts/t']);
+  const { body, repairs } = repairDeadLinks(
+    '[[concepts/x]] 和 [[concepts/x]]',
+    (x) => known.has(x),
+    () => 'concepts/t',
+  );
+  assert.equal(repairs.length, 2);
+  assert.equal(body, '[[concepts/t]] 和 [[concepts/t]]');
 });

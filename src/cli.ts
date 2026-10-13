@@ -4,13 +4,34 @@
  */
 import path from 'node:path';
 import { parseArgs } from 'node:util';
-import { runCompile } from './compile.js';
+import { canonicalTitleKey, renderLinkCandidates, runCompile } from './compile.js';
 import { loadDotEnv, llmConfig } from './env.js';
 import { createLlmClient } from './llm.js';
 import { analyzeGraph, formatGraphReport, renderMermaid } from './graph.js';
+import { repairDeadLinks } from './links.js';
+import {
+  applySplit,
+  buildSplitSystem,
+  buildSplitUser,
+  countChars,
+  isOverLimit,
+  splitProposalSchema,
+  type SplitProposal,
+} from './split.js';
+import {
+  applyConflicts,
+  buildConflictSystem,
+  buildConflictUser,
+  conflictProposalSchema,
+  formatConflictReport,
+  hasDisputes,
+  parseDisputes,
+  type ConflictProposal,
+} from './conflict.js';
 import { runQuery } from './query.js';
-import { ensureIndex, reindex, statusReport, type StatusReport } from './reindex.js';
-import { ensureDirs, readIndex, ROOT } from './store.js';
+import { ensureIndex, reindex, scan, statusReport, type StatusReport } from './reindex.js';
+import type { IndexEntry } from './types.js';
+import { ensureDirs, nextFreeId, readIndex, readPage, readRaw, ROOT, slugify, withBody, writePage } from './store.js';
 
 const CLI_OPTIONS = {
   all: { type: 'boolean', default: false },
@@ -18,6 +39,9 @@ const CLI_OPTIONS = {
   'dry-run': { type: 'boolean', default: false },
   mermaid: { type: 'boolean', default: false },
   'max-nodes': { type: 'string', default: '0' },
+  limit: { type: 'string', default: '400' },
+  detect: { type: 'boolean', default: false },
+  apply: { type: 'boolean', default: false },
   verbose: { type: 'boolean', default: false },
   help: { type: 'boolean', short: 'h', default: false },
 } as const;
@@ -36,6 +60,11 @@ const USAGE = `my-wiki —— 把 raw/ 下的素材编译成互相链接的 Mark
   pnpm dev graph                      看链接图的形状：连通块、超级节点、孤立页
   pnpm dev graph --mermaid            额外输出 Mermaid（可贴进任何 Markdown 渲染）
   pnpm dev graph --mermaid --max-nodes 30   页面很多时只画连接最多的 30 个
+  pnpm dev repair                     把死链按别名/标题就近改写为正确 id（--dry-run 预览）
+  pnpm dev split                      把超过字数上限的页面拆成「枢纽页 + 子主题页」（--dry-run 预览，--limit N 调阈值）
+  pnpm dev conflict                   报告所有已记录的「争议」小节（离线）
+  pnpm dev conflict --detect          用 LLM 比对多素材页面，找出隐藏的矛盾
+  pnpm dev conflict --detect --apply  找出矛盾并写入「争议」小节（再 reindex）
 
 选项：--all --force --dry-run --mermaid --max-nodes N --verbose  -h, --help
 
@@ -230,6 +259,285 @@ async function main(): Promise<void> {
       if (parsed.values.mermaid) {
         console.log('');
         console.log(renderMermaid(entries, maxNodes));
+      }
+      return;
+    }
+
+    case 'repair': {
+      await ensureDirs();
+      const dryRun = parsed.values['dry-run'];
+      // 先保证索引/反向链接是最新的，再扫描页面正文
+      await ensureIndex();
+      const snapshot = await scan();
+
+      const idSet = new Set(snapshot.ids);
+      // 标题/别名 → id（与 compile 的 buildTitleIndex 同样用 canonicalTitleKey 归一化）
+      const titleIndex = new Map<string, string>();
+      for (const id of snapshot.ids) {
+        const page = snapshot.pages.get(id);
+        if (page === undefined) continue;
+        for (const name of [page.meta.title, ...page.meta.aliases]) {
+          const key = canonicalTitleKey(name);
+          if (key !== '' && !titleIndex.has(key)) titleIndex.set(key, id);
+        }
+      }
+      // 就近匹配：先比 id 末段，再比标题/别名
+      const resolve = (id: string): string | null => {
+        const bare = id.replace(/^[a-z]+\//i, '');
+        const key = canonicalTitleKey(bare);
+        if (key === '') return null;
+        for (const known of snapshot.ids) {
+          if (canonicalTitleKey(known.split('/').pop() ?? '') === key) return known;
+        }
+        return titleIndex.get(key) ?? null;
+      };
+
+      let totalRepairs = 0;
+      const allUnrepaired = new Set<string>();
+      let written = 0;
+      for (const id of snapshot.ids) {
+        const page = snapshot.pages.get(id);
+        if (page === undefined) continue;
+        const { body, repairs, unrepaired } = repairDeadLinks(page.body, (x) => idSet.has(x), resolve);
+        if (repairs.length === 0) continue;
+        totalRepairs += repairs.length;
+        for (const r of repairs) console.log(`  ${id}：${r.from} → ${r.to}`);
+        for (const u of unrepaired) allUnrepaired.add(u);
+        if (!dryRun && (await writePage(withBody(page, body)))) written += 1;
+      }
+
+      if (totalRepairs === 0) {
+        console.log(dryRun ? '未发现可修复的死链（dry-run）。' : '未发现可修复的死链。');
+      } else if (dryRun) {
+        console.log(`\n[dry-run] 将修复 ${totalRepairs} 条死链，未改动任何文件。`);
+      } else {
+        await reindex();
+        const tail =
+          allUnrepaired.size > 0
+            ? `；${allUnrepaired.size} 条无法修复（${[...allUnrepaired].join('、')}），需人工处理。`
+            : '。';
+        console.log(`\n已修复 ${totalRepairs} 条死链（回写 ${written} 个页面）${tail}`);
+      }
+      return;
+    }
+
+    case 'split': {
+      // 参数校验放在碰 wiki 之前
+      const limit = Number(parsed.values.limit);
+      if (!Number.isInteger(limit) || limit <= 0) {
+        console.error(`--limit 必须是正整数，当前值：${JSON.stringify(parsed.values.limit)}`);
+        process.exitCode = 1;
+        return;
+      }
+
+      await ensureDirs();
+      const dryRun = parsed.values['dry-run'];
+      await ensureIndex();
+      const snapshot = await scan();
+
+      const idSet = new Set(snapshot.ids);
+      const titleIndex = new Map<string, string>();
+      for (const id of snapshot.ids) {
+        const page = snapshot.pages.get(id);
+        if (page === undefined) continue;
+        for (const name of [page.meta.title, ...page.meta.aliases]) {
+          const key = canonicalTitleKey(name);
+          if (key !== '' && !titleIndex.has(key)) titleIndex.set(key, id);
+        }
+      }
+      const resolve = (id: string): string | null => {
+        const bare = id.replace(/^[a-z]+\//i, '');
+        const key = canonicalTitleKey(bare);
+        if (key === '') return null;
+        for (const known of snapshot.ids) {
+          if (canonicalTitleKey(known.split('/').pop() ?? '') === key) return known;
+        }
+        return titleIndex.get(key) ?? null;
+      };
+
+      // 候选页清单：供 LLM 知道能链哪些 id（用 index 卡片渲染，与 compile 一致）
+      const cards: IndexEntry[] = snapshot.ids.map((id) => {
+        const p = snapshot.pages.get(id);
+        return {
+          id,
+          type: p?.meta.type ?? 'concept',
+          title: p?.meta.title ?? id,
+          oneLiner: p?.meta.oneLiner ?? '',
+          aliases: p?.meta.aliases ?? [],
+          tags: p?.meta.tags ?? [],
+          outLinks: [],
+          inLinks: [],
+          updated: p?.meta.updated ?? '',
+        };
+      });
+      const config = llmConfig();
+      const llm = createLlmClient({ config });
+
+      const targets = snapshot.ids.filter((id) => {
+        const page = snapshot.pages.get(id);
+        if (page === undefined || page.meta.type === 'source') return false;
+        return isOverLimit(page.body, limit);
+      });
+
+      if (targets.length === 0) {
+        console.log(dryRun ? `未发现超过 ${limit} 字的页面（dry-run）。` : `未发现超过 ${limit} 字的页面。`);
+        return;
+      }
+
+      let splitCount = 0;
+      const allWarnings: string[] = [];
+      let written = 0;
+      const newIds: string[] = [];
+
+      for (const id of targets) {
+        const page = snapshot.pages.get(id);
+        if (page === undefined) continue;
+        const chars = countChars(page.body);
+        if (dryRun) {
+          console.log(`  [dry-run] ${id}（${chars} 字）将拆分为子主题页`);
+          splitCount += 1;
+          continue;
+        }
+
+        const linkCandidates = renderLinkCandidates(cards, newIds, id);
+        let proposal: SplitProposal;
+        try {
+          proposal = (await llm.structured({
+            tag: `split-${slugify(id.replace(/\//g, '-'))}`,
+            system: await buildSplitSystem(),
+            user: await buildSplitUser(page, limit, linkCandidates),
+            schema: splitProposalSchema,
+          })) as SplitProposal;
+        } catch (error) {
+          console.error(
+            `  ${id}：LLM 拆分失败，跳过（${error instanceof Error ? error.message : String(error)}）`,
+          );
+          continue;
+        }
+
+        // 先分配不冲突的子页 id，再交给纯函数 applySplit 落实
+        const subIds: string[] = [];
+        for (const sub of proposal.subpages) {
+          subIds.push(await nextFreeId(page.meta.type, slugify(sub.slug)));
+        }
+        const result = applySplit(page, proposal, { knownIds: idSet, subIds, resolve });
+
+        if (await writePage(result.hub)) written += 1;
+        for (const sub of result.subpages) if (await writePage(sub)) written += 1;
+        for (const subId of subIds) {
+          idSet.add(subId);
+          newIds.push(subId);
+        }
+        splitCount += 1;
+        console.log(
+          `  ${id}（${chars} 字）→ 枢纽页 + ${result.subpages.length} 个子页：${subIds.join('、')}`,
+        );
+        for (const w of result.warnings) allWarnings.push(`${id}：${w}`);
+      }
+
+      if (dryRun) {
+        console.log(`\n[dry-run] 将拆分 ${splitCount} 个页面，未改动任何文件。`);
+        return;
+      }
+
+      await reindex();
+      const tail =
+        allWarnings.length > 0 ? `\n  警告：\n${allWarnings.map((w) => `    - ${w}`).join('\n')}` : '';
+      console.log(`\n已拆分 ${splitCount} 个页面（回写 ${written} 个文件）${tail}`);
+      return;
+    }
+
+    case 'conflict': {
+      await ensureDirs();
+      const snapshot = await scan();
+      const detect = parsed.values.detect;
+      const apply = parsed.values.apply;
+
+      if (!detect) {
+        // 报告模式（离线）：列出所有已记录「争议」小节的页面
+        const items = snapshot.ids
+          .map((id) => {
+            const page = snapshot.pages.get(id);
+            const disputes = page === undefined ? null : parseDisputes(page.body);
+            return disputes === null ? null : { id, disputes };
+          })
+          .filter((x): x is { id: string; disputes: string } => x !== null);
+        console.log(formatConflictReport(items));
+        return;
+      }
+
+      // 检测模式：只对「≥2 个素材、且尚无争议小节」的 concept/entity 页跑 LLM
+      const candidates = snapshot.ids.filter((id) => {
+        const page = snapshot.pages.get(id);
+        if (page === undefined || page.meta.type === 'source') return false;
+        return page.meta.sources.length >= 2 && !hasDisputes(page.body);
+      });
+
+      if (candidates.length === 0) {
+        console.log('没有需要检测的多素材页面（或它们都已记录过争议）。');
+        return;
+      }
+
+      const config = llmConfig();
+      const llm = createLlmClient({ config });
+      let found = 0;
+      let written = 0;
+
+      for (const id of candidates) {
+        const page = snapshot.pages.get(id);
+        if (page === undefined) continue;
+
+        // 收集该页引用的素材原文（缺失则跳过该素材并提示）
+        const sourceTexts: { id: string; text: string }[] = [];
+        for (const src of page.meta.sources) {
+          try {
+            sourceTexts.push({ id: src, text: await readRaw(src) });
+          } catch {
+            console.error(`  ${id}：素材 ${src} 读取失败，跳过该素材`);
+          }
+        }
+        if (sourceTexts.length < 2) {
+          console.log(`  ${id}：可用素材不足 2 份，跳过`);
+          continue;
+        }
+
+        let proposal: ConflictProposal;
+        try {
+          proposal = (await llm.structured({
+            tag: `conflict-${slugify(id.replace(/\//g, '-'))}`,
+            system: await buildConflictSystem(),
+            user: await buildConflictUser(page, sourceTexts),
+            schema: conflictProposalSchema,
+          })) as ConflictProposal;
+        } catch (error) {
+          console.error(
+            `  ${id}：LLM 冲突检测失败，跳过（${error instanceof Error ? error.message : String(error)}）`,
+          );
+          continue;
+        }
+
+        if (proposal.conflicts.length === 0) {
+          console.log(`  ${id}：未检测到矛盾`);
+          continue;
+        }
+        found += 1;
+        console.log(
+          `  ${id}：检测到 ${proposal.conflicts.length} 条矛盾（${proposal.conflicts
+            .map((c) => c.topic)
+            .join('、')}）`,
+        );
+        if (apply) {
+          if (await writePage(applyConflicts(page, proposal))) written += 1;
+        }
+      }
+
+      if (!apply) {
+        console.log(
+          `\n[dry-run] 检测到 ${found} 个页面存在隐藏矛盾；加 --apply 才会写入「争议」小节。`,
+        );
+      } else {
+        await reindex();
+        console.log(`\n已检测 ${candidates.length} 个页面，发现 ${found} 个有矛盾，回写 ${written} 个文件。`);
       }
       return;
     }

@@ -8,14 +8,22 @@
  * 用法：
  *   pnpm smoke            跑一遍并自动清理产物
  *   pnpm smoke --keep     保留产物，便于人工检查 wiki/
+ *
+ * 安全：运行前会把真实 wiki/ 与 .state/ 整体备份到临时目录，万一内存快照还原
+ * （snapshotWiki/restoreWiki）将来再出 bug，也能从磁盘备份兜底还原，绝不会把
+ * 用户用真实模型编译出来的产物弄丢。
  */
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { readdir, rm } from 'node:fs/promises';
+import { cp, mkdtemp, readdir, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { headingsOf, runCompile, type CompileSummary } from '../src/compile.js';
-import { parseOwnLinks } from '../src/links.js';
+import { parseOwnLinks, stripAutoBacklinks } from '../src/links.js';
 import { NO_COVERAGE_ANSWER, runQuery } from '../src/query.js';
 import { extractJson, type ChatFn, type ChatMessage, type LlmClient } from '../src/llm.js';
+import type { Page } from '../src/types.js';
 import { reindex } from '../src/reindex.js';
 import {
   listPageIds,
@@ -26,7 +34,10 @@ import {
   readManifest,
   readPage,
   readRaw,
+  STATE_DIR,
+  WIKI_DIR,
   writeManifest,
+  writePage,
   writePassCache,
   writeRawFile,
 } from '../src/store.js';
@@ -195,10 +206,20 @@ interface FakeOptions {
 function makeFakeChat(report: string[], options: FakeOptions = {}): ChatFn {
   let injectedBadLink = false;
   let applyDraftCalls = 0;
+  /**
+   * 当前草稿被标记为「必须失败」。
+   *
+   * 不能只在 structured 里抛一次就完事——compile 的 apply 对每个页面都有
+   * 「结构化失败 → 纯文本兜底」的降级（见 src/compile.ts），只抛一次会被兜底
+   * 悄悄消化成一次成功，检查就会以「Missing expected rejection」失败。
+   * 所以兜底请求必须跟着一起失败，故障才真的能传到 runCompile 外面。
+   */
+  let failingDraft = false;
 
   const countApplyDraft = (): void => {
     applyDraftCalls += 1;
-    if (options.failApplyAtCall !== undefined && applyDraftCalls === options.failApplyAtCall) {
+    failingDraft = options.failApplyAtCall === applyDraftCalls;
+    if (failingDraft) {
       throw new Error(`模拟的 apply 故障：第 ${applyDraftCalls} 个页面草稿生成失败`);
     }
   };
@@ -212,13 +233,24 @@ function makeFakeChat(report: string[], options: FakeOptions = {}): ChatFn {
 
     const isSecond = user.includes(SECOND_MARK);
 
+    // 纯文本兜底请求（它的 system 里同样带「新页面写正文」那句，所以必须排在前面判断）
+    if (system.includes('只输出正文的 Markdown 本身')) {
+      if (failingDraft) {
+        throw new Error(`模拟的 apply 故障：第 ${applyDraftCalls} 个页面草稿生成失败（兜底同样失败）`);
+      }
+      return '兜底正文占位——正常场景不该走到纯文本兜底。';
+    }
+
     if (system.includes('抽取器')) {
       report.push(`extract   → 返回${isSecond ? '第二份素材' : '第一份素材'}的抽取结果（含 1 条编造摘录）`);
       return JSON.stringify(isSecond ? EXTRACT2 : EXTRACT);
     }
 
     if (system.includes('规划阶段')) {
-      if (isSecond) {
+      // 这里**不能**用 isSecond 判断：plan 的【要求】里本来就用「向量检索」举了例子，
+      // 用正文特征判断会永远为真，结果第一份素材也拿到 PLAN2，RAG 页根本建不出来。
+      // plan 的提示词里写明了素材路径，用它区分才可靠。
+      if (user.includes(RAW2)) {
         const cards = user.split('【wiki 现有页面清单】')[1] ?? '';
         report.push(
           `plan      → 第二份素材：清单${cards.includes('（空）') ? '为空' : '里已有页面'}；返回 1 update + 2 create + 1 link`,
@@ -244,20 +276,38 @@ function makeFakeChat(report: string[], options: FakeOptions = {}): ChatFn {
       }
 
       const others = candidateIds(user).filter((candidate) => candidate !== id).slice(0, 2);
+      // 实体页模板（schema/templates/entity.md）的小节与概念页不同，
+      // 套概念页结构会被「新增了兜底小节」的更新完整性校验拦下
+      const isEntity = system.includes('页面模板（entity）');
+      const body = isEntity
+        ? [
+            '## 是什么',
+            '',
+            `「${id}」的身份与定位，由离线冒烟脚本生成。`,
+            '',
+            '## 为什么重要',
+            '',
+            ...others.map((other) => `- 与 [[${other}]] 相关。`),
+            '',
+            '## 出处',
+            '',
+            '- [[sources/llm-wiki-intro]]：「同一个问题问 100 次，它就要重复这个过程 100 次」',
+          ].join('\n')
+        : [
+            '## 定义',
+            '',
+            `「${id}」的定义占位，由离线冒烟脚本生成。`,
+            '',
+            '## 与其他概念的关系',
+            '',
+            ...others.map((other) => `- 与 [[${other}]] 相关。`),
+            '',
+            '## 出处',
+            '',
+            '- [[sources/llm-wiki-intro]]：「同一个问题问 100 次，它就要重复这个过程 100 次」',
+          ].join('\n');
       return JSON.stringify({
-        body: [
-          '## 定义',
-          '',
-          `「${id}」的定义占位，由离线冒烟脚本生成。`,
-          '',
-          '## 与其他概念的关系',
-          '',
-          ...others.map((other) => `- 与 [[${other}]] 相关。`),
-          '',
-          '## 出处',
-          '',
-          '- [[sources/llm-wiki-intro]]：「同一个问题问 100 次，它就要重复这个过程 100 次」',
-        ].join('\n'),
+        body,
         tags: ['冒烟'],
         aliases: [],
       });
@@ -278,7 +328,10 @@ function makeFakeChat(report: string[], options: FakeOptions = {}): ChatFn {
             (candidate) => candidate !== id && !current.includes(`[[${candidate}]]`),
           )
         : undefined;
-      const heading = '## 与其他概念的关系';
+      // 插入点必须落在**该模板本来就有**的小节下，否则等于新开兜底小节
+      const heading = system.includes('页面模板（entity）')
+        ? '## 为什么重要'
+        : '## 与其他概念的关系';
       const body =
         linkTarget === undefined
           ? current
@@ -309,7 +362,16 @@ function totalCalls(counts: ReadonlyMap<string, number>): number {
 function fakeClient(report: string[], chat: ChatFn, counts: Map<string, number>): LlmClient {
   return {
     callCount: () => totalCalls(counts),
-    text: async () => '',
+    // 不能固定返回空串：兜底路径要真的经过假模型，故障才能从里面传出来。
+    // 计数也要照 structured 那样记——answer 走的是 text，漏记会让「恰好 2 次调用」的断言落空
+    text: async (prompt) => {
+      const stage = prompt.tag.split('-')[0] ?? prompt.tag;
+      counts.set(stage, (counts.get(stage) ?? 0) + 1);
+      return chat([
+        { role: 'system', content: prompt.system },
+        { role: 'user', content: prompt.user },
+      ]);
+    },
     structured: async (prompt) => {
       const stage = prompt.tag.split('-')[0] ?? prompt.tag;
       counts.set(stage, (counts.get(stage) ?? 0) + 1);
@@ -607,11 +669,14 @@ async function checkBodyOnlyFallback(): Promise<void> {
     });
 
     const ids = await listPageIds();
-    assert.ok(ids.length >= 6, `应把 6 个页面都建出来，实际 ${ids.length} 个`);
-    assert.equal(bodyOnlyTags.length, 6, '六个页面草稿都应走兜底路径');
+    // 4 = PLAN 里的 3 个 create + 程序自动补的素材摘要页（sources/llm-wiki-intro）
+    assert.ok(ids.length >= 4, `应把 4 个页面都建出来，实际 ${ids.length} 个`);
+    // 只统计走 LLM 草稿的页面：sources/ 摘要页由程序装配，不经过草稿生成
+    assert.equal(bodyOnlyTags.length, 3, '三个 create 的页面草稿都应走兜底路径');
 
-    const page = await readPage('concepts/llm-wiki');
-    assert.equal(page.body.trim(), fallbackBody, '正文应来自纯文本模式');
+    const page = await readPage('concepts/retrieval-augmented-generation');
+    // reindex 会把反向链接区块追加进正文，比较前先剥掉
+    assert.equal(stripAutoBacklinks(page.body).trim(), fallbackBody, '正文应来自纯文本模式');
     assert.deepEqual(page.meta.tags, [], '兜底拿不到 tags，应回落到空数组');
     assert.deepEqual(page.meta.aliases, []);
     assert.match(page.body, /\[\[sources\/llm-wiki-intro\]\]/, '兜底正文里的链接仍要通过校验');
@@ -654,6 +719,19 @@ async function restoreWiki(snapshot: WikiSnapshot): Promise<void> {
   for (const id of await listPageIds()) await rm(pagePath(id), { force: true });
   for (const page of snapshot.pages.values()) await writePage(page);
   await writeManifest(snapshot.manifest as never);
+  await reindex();
+}
+
+/**
+ * 磁盘级兜底还原：把 main() 开头备份的 wiki/ 与 .state/ 整目录拷回。
+ * 这是内存快照还原（restoreWiki）之外的安全网——只要备份在，真实产物就能找回。
+ */
+async function restoreWikiFromDisk(backup: string): Promise<void> {
+  for (const sub of [WIKI_DIR, STATE_DIR]) {
+    await rm(sub, { recursive: true, force: true });
+    const src = path.join(backup, path.basename(sub));
+    if (existsSync(src)) await cp(src, sub, { recursive: true });
+  }
   await reindex();
 }
 
@@ -826,7 +904,7 @@ async function checkDryRunKeepsWikiUntouched(): Promise<void> {
   console.log(`  计划 ${summary.planned} 份 · LLM 调用 ${report.length} 次 · wiki/、manifest、Pass 缓存均未被改动 ✓`);
 }
 
-async function main(): Promise<void> {
+export async function main(): Promise<void> {
   const keep = process.argv.includes('--keep');
   const dryRunOnly = process.argv.includes('--dry-run');
   const pagesBefore = new Set(await listPageIds());
@@ -842,61 +920,84 @@ async function main(): Promise<void> {
   const counts = new Map<string, number>();
   let summary: CompileSummary | undefined;
   let failure: unknown = null;
+  let diskBackup: string | undefined;
 
-  // 检查失败也必须走完清理，否则会把产物留在 wiki/ 里，
-  // 下一次运行看到的「初始现场」就是脏的（这个坑在开发时就踩到过一次）
+  // 磁盘安全网：先把真实 wiki/ 与 .state/ 整体备份到临时目录。
+  // 后续的内存快照还原（restoreWiki）若再出 bug，这里能兜底还原，绝不会弄丢真实产物。
+  diskBackup = await mkdtemp(path.join(os.tmpdir(), 'my-wiki-smoke-bak-'));
+  if (existsSync(WIKI_DIR)) await cp(WIKI_DIR, path.join(diskBackup, 'wiki'), { recursive: true });
+  if (existsSync(STATE_DIR)) await cp(STATE_DIR, path.join(diskBackup, '.state'), { recursive: true });
+
   try {
-    summary = await runCompile({
-      targets: [RAW],
-      all: false,
-      force: true,
-      dryRun: false,
-      verbose: true,
-      llm: fakeClient(report, makeFakeChat(report), counts),
-    });
+    // 检查失败也必须走完清理，否则会把产物留在 wiki/ 里，
+    // 下一次运行看到的「初始现场」就是脏的（这个坑在开发时就踩到过一次）
+    try {
+      summary = await runCompile({
+        targets: [RAW],
+        all: false,
+        force: true,
+        dryRun: false,
+        verbose: true,
+        llm: fakeClient(report, makeFakeChat(report), counts),
+      });
 
-    console.log('\n===== 假模型调用轨迹 =====');
-    for (const line of report) console.log(`  ${line}`);
+      console.log('\n===== 假模型调用轨迹 =====');
+      for (const line of report) console.log(`  ${line}`);
 
-    await checkIncrementalAndResume();
-    await checkApplyFailureLeavesNoResidue();
-    await checkForceAndHashChange();
-    await checkCompoundingUpdate();
-    await checkBodyOnlyFallback();
-    await checkQuery();
-  } catch (error) {
-    failure = error;
-    console.error(`\n✗ 检查未通过：${error instanceof Error ? error.message : String(error)}`);
-  }
-
-  const created = (await listPageIds()).filter((id) => !pagesBefore.has(id));
-  console.log('\n===== 汇总 =====');
-  console.log(
-    `  编译 ${summary?.compiled ?? 0} 份 · 新建 ${summary?.created.length ?? 0} 页 · 更新 ${summary?.updated.length ?? 0} 页`,
-  );
-  console.log(`  wiki 中实际新增 ${created.length} 个页面：${created.join(', ') || '无'}`);
-
-  if (keep) {
-    console.log('\n--keep 已指定，保留 wiki/ 产物供人工检查。');
-  } else {
-    // 清理：删掉本次产物、Pass 缓存并恢复 manifest，避免冒烟数据污染真实编译。
-    // 缓存虽只在 manifest 标记 ok 时才被读取（留着危害有限），但不清理就等于留下陷阱：
-    // 以后谁手工把 manifest 改成 ok 却没意识到页面早被删了，就会拿旧抽取结果去重新生成页面。
-    for (const id of created) await rm(pagePath(id), { force: true });
-    for (const raw of [RAW, RAW2]) {
-      await rm(passCachePath('extract', raw), { force: true });
-      await rm(passCachePath('plan', raw), { force: true });
+      await checkIncrementalAndResume();
+      await checkApplyFailureLeavesNoResidue();
+      await checkForceAndHashChange();
+      await checkCompoundingUpdate();
+      await checkBodyOnlyFallback();
+      await checkQuery();
+    } catch (error) {
+      failure = error;
+      console.error(`\n✗ 检查未通过：${error instanceof Error ? error.message : String(error)}`);
     }
-    if (hadManifest) await writeManifest(manifestBefore);
-    else await rm(MANIFEST_FILE, { force: true });
-    const rebuilt = await reindex();
-    console.log(`\n已清理产物，wiki 恢复为 ${rebuilt.ids.length} 个页面。`);
+
+    const created = (await listPageIds()).filter((id) => !pagesBefore.has(id));
+    console.log('\n===== 汇总 =====');
+    console.log(
+      `  编译 ${summary?.compiled ?? 0} 份 · 新建 ${summary?.created.length ?? 0} 页 · 更新 ${summary?.updated.length ?? 0} 页`,
+    );
+    console.log(`  wiki 中实际新增 ${created.length} 个页面：${created.join(', ') || '无'}`);
+
+    if (keep && failure === null) {
+      console.log('\n--keep 已指定，保留 wiki/ 产物供人工检查。');
+    } else if (failure === null) {
+      // 清理：删掉本次产物、Pass 缓存并恢复 manifest，避免冒烟数据污染真实编译。
+      // 缓存虽只在 manifest 标记 ok 时才被读取（留着危害有限），但不清理就等于留下陷阱：
+      // 以后谁手工把 manifest 改成 ok 却没意识到页面早被删了，就会拿旧抽取结果去重新生成页面。
+      for (const id of created) await rm(pagePath(id), { force: true });
+      for (const raw of [RAW, RAW2]) {
+        await rm(passCachePath('extract', raw), { force: true });
+        await rm(passCachePath('plan', raw), { force: true });
+      }
+      if (hadManifest) await writeManifest(manifestBefore);
+      else await rm(MANIFEST_FILE, { force: true });
+      const rebuilt = await reindex();
+      console.log(`\n已清理产物，wiki 恢复为 ${rebuilt.ids.length} 个页面。`);
+    }
+    // failure !== null 时不走上面的清理——交给 finally 里的磁盘备份兜底还原
+  } finally {
+    // 失败时：内存快照若没救回来，用磁盘备份兜底还原（隔离副本）。
+    // 真实 wiki/ 由外层 scripts/smoke.ts 的隔离机制保证不被触碰。
+    if (failure !== null && diskBackup !== undefined) {
+      await restoreWikiFromDisk(diskBackup);
+      console.log('（已从磁盘备份还原隔离副本）');
+    }
+    if (diskBackup !== undefined) await rm(diskBackup, { recursive: true, force: true });
   }
 
   if (failure !== null) process.exitCode = 1;
 }
 
-main().catch((error: unknown) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = 1;
-});
+// 仅当作为入口直接执行时才自动跑；被 scripts/smoke.ts 以隔离模式导入时不自动跑。
+const invokedDirectly =
+  process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (invokedDirectly) {
+  main().catch((error: unknown) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
+}
