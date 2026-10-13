@@ -3,6 +3,7 @@
  * 业务逻辑一律在 reindex / store / compile / query 里。
  */
 import path from 'node:path';
+import { createInterface } from 'node:readline';
 import { parseArgs } from 'node:util';
 import { canonicalTitleKey, renderLinkCandidates, runCompile } from './compile.js';
 import { loadDotEnv, llmConfig } from './env.js';
@@ -28,7 +29,9 @@ import {
   parseDisputes,
   type ConflictProposal,
 } from './conflict.js';
+import { startServer } from './serve.js';
 import { runQuery } from './query.js';
+import { buildReadOnlyTools, runAgent, MAX_AGENT_STEPS, type AgentResult } from './agent.js';
 import { ensureIndex, reindex, scan, statusReport, type StatusReport } from './reindex.js';
 import type { IndexEntry } from './types.js';
 import { ensureDirs, nextFreeId, readIndex, readPage, readRaw, ROOT, slugify, withBody, writePage } from './store.js';
@@ -42,6 +45,8 @@ const CLI_OPTIONS = {
   limit: { type: 'string', default: '400' },
   detect: { type: 'boolean', default: false },
   apply: { type: 'boolean', default: false },
+  chat: { type: 'boolean', default: false },
+  port: { type: 'string', default: '4173' },
   verbose: { type: 'boolean', default: false },
   help: { type: 'boolean', short: 'h', default: false },
 } as const;
@@ -65,8 +70,13 @@ const USAGE = `my-wiki —— 把 raw/ 下的素材编译成互相链接的 Mark
   pnpm dev conflict                   报告所有已记录的「争议」小节（离线）
   pnpm dev conflict --detect          用 LLM 比对多素材页面，找出隐藏的矛盾
   pnpm dev conflict --detect --apply  找出矛盾并写入「争议」小节（再 reindex）
+  pnpm dev serve                      启动极简本地查看器（只读，默认 http://localhost:4173）
+  pnpm dev serve --port 8080          换端口
+  pnpm dev agent "问题"                用 agent（工具调用循环）回答，可多步深挖 / 溯源
+  pnpm dev agent --chat                进入多轮对话模式（输入 exit 退出）
+  pnpm dev agent "问题" --apply        允许 agent 产出写入类计划（最终落盘仍需确认）
 
-选项：--all --force --dry-run --mermaid --max-nodes N --verbose  -h, --help
+选项：--all --force --dry-run --mermaid --max-nodes N --verbose --port N --chat --apply  -h, --help
 
 实现进度见 doc/DEVELOPMENT.md。
 `;
@@ -239,6 +249,107 @@ async function main(): Promise<void> {
       );
       // 引用了不存在的页面 = 答案不可信，必须以非 0 退出，别让脚本把它当成功
       if (result.badCitations.length > 0) process.exitCode = 1;
+      return;
+    }
+
+    case 'agent': {
+      const apply = parsed.values.apply === true;
+      const chat = parsed.values.chat === true;
+      const verbose = parsed.values.verbose === true;
+      const question = parsed.positionals.slice(1).join(' ').trim();
+      if (question === '' && !chat) {
+        console.error('用法：pnpm dev agent "你的问题"  （可选 --chat / --verbose / --apply）');
+        process.exitCode = 1;
+        return;
+      }
+      // 只读加载索引：绝不调 ensureIndex，避免只读路径误写 wiki/index.md（S13 踩过的坑）。
+      // 索引缺失时退化为 scan 在内存现算，同样不落盘。
+      const entries: IndexEntry[] = [];
+      const existing = await readIndex();
+      if (existing !== null) {
+        entries.push(...existing.pages);
+      } else {
+        const snap = await scan();
+        for (const id of snap.ids) {
+          const p = snap.pages.get(id);
+          if (p === undefined) continue;
+          entries.push({
+            id,
+            type: p.meta.type,
+            title: p.meta.title,
+            oneLiner: p.meta.oneLiner,
+            aliases: p.meta.aliases,
+            tags: p.meta.tags,
+            outLinks: snap.outLinks.get(id) ?? [],
+            inLinks: snap.inLinks.get(id) ?? [],
+            updated: p.meta.updated,
+          });
+        }
+      }
+      const knownIds = new Set(entries.map((e) => e.id));
+      const config = llmConfig();
+      const llm = createLlmClient({ config });
+      const tools = buildReadOnlyTools(entries, llm);
+
+      const printResult = (result: AgentResult): void => {
+        if (verbose) {
+          for (const s of result.steps) {
+            console.log(`\n[思考] ${s.thought}`);
+            console.log(`[动作] ${s.action}${s.actionInput ? ' ' + JSON.stringify(s.actionInput) : ''}`);
+            if (s.observation) console.log(`[观察] ${s.observation}`);
+          }
+        }
+        console.log('');
+        console.log(result.answer);
+        console.log('');
+        console.log(
+          `引用校验：${result.citations.length === 0 ? '通过' : `失败 → ${result.citations.join(', ')}`}` +
+            ` · 步数 ${result.steps.length} · LLM 调用 ${llm.callCount()} 次`,
+        );
+      };
+
+      if (!chat) {
+        const result = await runAgent({
+          question,
+          llm,
+          tools,
+          entries,
+          knownIds,
+          maxSteps: MAX_AGENT_STEPS,
+          allowWrite: apply,
+        });
+        printResult(result);
+        if (result.citations.length > 0) process.exitCode = 1;
+        return;
+      }
+
+      // --chat：多轮 REPL，上下文持续累积
+      console.log('进入多轮对话（输入 exit 退出）。');
+      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      const ask = (): Promise<string> =>
+        new Promise((resolve) => {
+          rl.question('\n你> ', (line) => resolve(line));
+        });
+      let seed: string | undefined;
+      for (;;) {
+        const line = (await ask()).trim();
+        if (line === 'exit' || line === 'quit') break;
+        if (line === '') continue;
+        const result = await runAgent({
+          question: line,
+          llm,
+          tools,
+          entries,
+          knownIds,
+          seedTranscript: seed,
+          maxSteps: MAX_AGENT_STEPS,
+          allowWrite: apply,
+        });
+        printResult(result);
+        if (result.citations.length > 0) process.exitCode = 1;
+        seed = result.transcript;
+      }
+      rl.close();
       return;
     }
 
@@ -539,6 +650,17 @@ async function main(): Promise<void> {
         await reindex();
         console.log(`\n已检测 ${candidates.length} 个页面，发现 ${found} 个有矛盾，回写 ${written} 个文件。`);
       }
+      return;
+    }
+
+    case 'serve': {
+      const port = Number(parsed.values.port);
+      if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+        console.error(`--port 必须是 1~65535 之间的整数，当前值：${JSON.stringify(parsed.values.port)}`);
+        process.exitCode = 1;
+        return;
+      }
+      await startServer(port);
       return;
     }
 

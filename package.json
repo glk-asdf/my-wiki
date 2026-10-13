@@ -10,7 +10,7 @@
     "dev": "tsx src/cli.ts",
     "smoke": "tsx scripts/smoke.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test tests/links.test.ts tests/store.test.ts tests/llm.test.ts tests/compile.test.ts tests/query.test.ts tests/graph.test.ts tests/split.test.ts tests/conflict.test.ts"
+    "test": "node --import tsx --test tests/links.test.ts tests/store.test.ts tests/llm.test.ts tests/compile.test.ts tests/query.test.ts tests/graph.test.ts tests/split.test.ts tests/conflict.test.ts tests/serve.test.ts tests/agent.test.ts"
   },
   "dependencies": {
     "gray-matter": "^4.0.3",

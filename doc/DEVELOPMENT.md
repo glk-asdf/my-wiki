@@ -1,6 +1,7 @@
 # LLM Wiki 最小实现 —— 分步开发文档
 
-> 配套文档：`doc/DESIGN.md`（讲**为什么这样设计**）。本文件只讲**按什么顺序敲代码**。
+> 配套文档：`doc/DESIGN.md`（讲**为什么这样设计**）、`doc/AGENT.md`（S13 之后的下一个里程碑：agent 层设计）。
+> 本文件只讲**按什么顺序敲代码**。
 > 每一步都保证「做完就能跑、就能看到东西」，不做需要两步才能验证的行为。
 
 ---
@@ -31,6 +32,7 @@
 | S11 | `update` / `link` / `noop` + 复利实验 | S10 | 有 | M4 |
 | S12 | `query.ts` 问答 | S5 + S6 | 有 | M5 |
 | S13 | 可选扩展 | S12 | 有 | M6 |
+| S14 | Agent 层（工具调用循环） | S12 + S13 | 有 | M7 |
 
 **S0 ~ S5 全程不需要 API Key**，可以先把「不必动脑的部分」一次性写完。
 **S6 是分水岭**，从这一步起每次调试都要花钱，所以 S7 之前的准备工作要扎实。
@@ -917,7 +919,7 @@ pnpm dev compile --all --force → 允许内容变化，但页面里不得出现
 
 ## S13. 可选扩展（M6，按兴趣选做）
 
-**已实现：`graph --mermaid`**（`src/graph.ts`）、**断链自动修复 `repair`**（`src/links.ts` 的 `repairDeadLinks` + `src/cli.ts`）、**页面拆分 `split`**（`src/split.ts` 的 `applySplit` + `src/cli.ts`）与 **冲突检测 `conflict`**（`src/conflict.ts` 的 `applyConflicts` + `src/cli.ts`）
+**已实现：`graph --mermaid`**（`src/graph.ts`）、**断链自动修复 `repair`**（`src/links.ts` 的 `repairDeadLinks` + `src/cli.ts`）、**页面拆分 `split`**（`src/split.ts` 的 `applySplit` + `src/cli.ts`）、**冲突检测 `conflict`**（`src/conflict.ts` 的 `applyConflicts` + `src/cli.ts`）与 **极简 Web UI `serve`**（`src/serve.ts` + `src/serve-ui.html`）
 
 ```bash
 pnpm dev graph                       # 连通块 / 超级节点 / 孤立页 / 自链接
@@ -934,6 +936,9 @@ pnpm dev split --limit 600           # 用别的字数阈值（默认 400）
 pnpm dev conflict                    # 报告所有已记录的「争议」小节（离线、只读）
 pnpm dev conflict --detect           # 用 LLM 比对多素材页面，找出隐藏矛盾（dry-run）
 pnpm dev conflict --detect --apply   # 找出矛盾并写入「争议」小节（再 reindex）
+
+pnpm dev serve                       # 启动极简本地查看器（只读，默认 http://localhost:4173）
+pnpm dev serve --port 8080           # 换端口
 ```
 
 `repair` 实现要点（都不涉及 LLM，纯函数 + 编排，可离线测）：
@@ -967,6 +972,13 @@ pnpm dev conflict --detect --apply   # 找出矛盾并写入「争议」小节�
 - **报告模式离线可读**：`conflict`（不带 `--detect`）只扫页面、列出所有已记录争议，纯读、不调 LLM、不落盘；`parseDisputes` 会把「（无）/ 无矛盾」这类占位符视为无争议。
 - **保守触发**：`--detect` 只对「≥2 个素材 且 尚无争议小节」的 concept/entity 页跑 LLM，且默认 dry-run，加 `--apply` 才写盘并重算反向链接；source 页跳过。
 
+`serve` 实现要点（极简、零前端依赖、只读）：
+
+- **不引任何前端框架 / Markdown 库**：内置一个覆盖本 wiki 语法的极简渲染器（`src/serve.ts` 的 `renderMarkdown`/`renderInline`）——标题、列表、粗体、行内代码、引用、代码块、`[[wikilink]]`；避免 CDN / 打包，离线即可用。
+- **只读**：服务端只 `readPage` 读 `wiki/` 与 `readIndex` 读 `.state/index.json`，**绝不写盘**；`/api/index.json` 供侧栏导航与反向链接，`/page/<id>` 返回已渲染 HTML。索引缺失时由 `scan()` 在内存现算（同样不写）。
+- **hash 路由**：链接写成 `#/page/<id>`，点击原生触发 `hashchange`，无需拦截；客户端（`src/serve-ui.html`）只负责拉索引、渲染侧栏、按 id 取页、展示反向链接与搜索过滤。
+- **死链可见**：未知 `[[id]]` 渲染成红色 `deadlink` 样式，便于在 UI 里一眼看到断链。
+
 实现要点（graph，都不涉及 LLM，纯函数、可离线测）：
 
 - **数据只来自 `.state/index.json`**，不额外扫盘。
@@ -982,11 +994,36 @@ pnpm dev conflict --detect --apply   # 找出矛盾并写入「争议」小节�
 - 这是本项目唯一一个「纯读」的命令，也是唯一一个**不依赖 LLM 质量**就能看出产物的地方——
   页面写得再好，如果是一盘散沙，这里一眼就能看出来。
 
-**其余扩展未做**，按「收益 / 成本」排序：
+**所有可选扩展均已完成。**
 
-| 扩展 | 成本 | 学到什么 |
-| :-- | :-- | :-- |
-| 极简 Web UI | 高 | 与学习目标关系最弱，最后再做 |
+---
+
+## S14. Agent 层（M7，工具调用循环）
+
+**目标**：在「只读查看器 `serve`」与「一次性问答 `query`」之上，套一个 ReAct 风格的工具调用循环，
+让使用者能多步推理、按需追到 `raw/` 原文、执行任务（找矛盾、查依赖、提拆分），所有「动手」仍走既有确定性内核。
+设计细节见 `doc/AGENT.md`。
+
+**实现要点**
+
+- **内核 `src/agent.ts`**（Phase 0）：`runAgent()` 把整段对话塞进「一个 user 消息」反复喂 `LlmClient.text()`，
+  每轮解析 `{thought, action, action_input}` → 跑工具 → observation 拼回 transcript，直到 `finish` 或步数耗尽（上限 `MAX_AGENT_STEPS=8`）。
+  复用 `extractJson` + `parseAction`，重试/落盘逻辑完全来自 `src/llm.ts`，不新增调用栈。
+  只读工具（`buildReadOnlyTools`）：`search_pages` / `read_page` / `read_source` / `get_links` /
+  `get_backlinks` / `find_path` / `list_disputes` / `graph_stats` / `ask`（最后一项包 `runQuery`，且 `skipIndex:true` 注入内存索引，绝不触发 `ensureIndex`）。
+- **写入工具（Phase 3，`--apply` 开启）**：`propose_split` / `propose_conflict` **只产出计划、不落盘**；
+  复用 `buildSplit*` / `splitProposalSchema` / `buildConflict*` / `conflictProposalSchema`，落盘仍走既有 `split` / `conflict --detect --apply` 命令。
+- **CLI `src/cli.ts` `case 'agent'`**（Phase 1）：`pnpm dev agent "问题"` 一次性回答；`--chat` 多轮 REPL（transcript 持续累积）；
+  `--verbose` 打印思考链；引用校验失败以非 0 退出。`allowWrite` 由 `--apply` 控制。
+- **Web `src/serve.ts` + `src/serve-ui.html`**（Phase 2）：`POST /api/agent` 在 `startServer` 内处理（不进纯函数 `handleRequest`，保持单测安全），
+  索引用只读的 `loadIndexForServe()`（缺失则 `scan()` 现算，绝不写盘）；UI 聊天侧栏把 `steps` 渲染成可折叠「思考过程」。
+- **单测 `tests/agent.test.ts`**：注入假 `LlmClient`，离线覆盖一步 finish / 多步分发 / 未知工具 / 步数上限 / 引用校验 / 写入工具开关 / 多轮累积（8 条）。
+
+**只读纪律（关键坑，已踩过）**：`agent` 命令与 `POST /api/agent` 都**不调用 `ensureIndex()`**——
+只读加载走 `readIndex()`，缺失则 `scan()` 内存现算，避免 S13 踩过的「只读命令误写 `wiki/index.md`」回放。
+写入类工具只用 `readPage` / `readRaw` / `llm.structured` 产出计划，不调 `writePage` / `applySplit` / `applyConflicts`。
+
+**验证**：`pnpm typecheck` 通过；`pnpm test` 107 项全绿（含 S14 新增 8 项）；`pnpm smoke` 通过并自动清理；`wiki/`、`raw/` 未被改动。
 
 ---
 
@@ -1036,3 +1073,4 @@ pnpm dev conflict --detect --apply   # 找出矛盾并写入「争议」小节�
 | S11 | DESIGN §9 M4 核心验收 |
 | S12 | DESIGN §5 问答流水线 |
 | S13 | DESIGN §1.2 不做清单、§9 M6 |
+| S14 | DESIGN §1.1 L5、doc/AGENT.md |

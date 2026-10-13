@@ -13,7 +13,7 @@ import { JSON_ONLY, createLlmClient, type LlmClient } from './llm.js';
 import { ensureIndex } from './reindex.js';
 import { loadQueryRules } from './schema.js';
 import { readIndex, readPage } from './store.js';
-import { selectionSchema, type IndexEntry, type Selection } from './types.js';
+import { selectionSchema, type IndexEntry, type Selection, type WikiIndex } from './types.js';
 
 /** 一次最多喂给模型的页面数。由程序强制执行，不依赖模型自觉 */
 export const MAX_SELECTED_PAGES = 8;
@@ -27,6 +27,9 @@ export interface QueryOptions {
   /** 注入用（测试/离线冒烟）；不传则按环境变量建真实客户端 */
   llm?: LlmClient;
   log?: (line: string) => void;
+  /** agent 场景：index 已加载且需保持只读时，跳过 ensureIndex 重写，直接注入现成 index */
+  skipIndex?: boolean;
+  index?: WikiIndex | null;
 }
 
 export interface QueryResult {
@@ -120,8 +123,8 @@ export async function runQuery(options: QueryOptions): Promise<QueryResult> {
     throw new Error('问题不能为空。用法：pnpm dev query "LLM Wiki 和 RAG 有什么区别？"');
   }
 
-  await ensureIndex();
-  const index = await readIndex();
+  if (!options.skipIndex) await ensureIndex();
+  const index = options.index ?? (await readIndex());
   const cards = index?.pages ?? [];
 
   // wiki 是空的：不必花钱调模型，直说没有
